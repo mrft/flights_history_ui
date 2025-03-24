@@ -435,7 +435,7 @@
      * @returns {Promise<Array<Object>>}
      */
     const fetchHistoryForDate = async (date) => {
-      const baseUrl = "../../flights_history/data/";
+      const baseUrl = "https://cdn.jsdelivr.net/gh/mrft/flights_history/data/";
       const dateString = new Date(date).toISOString().split('T')[0];
       const response = await fetch(`${baseUrl}${dateString}.jsonl`);
       const text = await response.text();

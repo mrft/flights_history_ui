@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="ie=edge">
+
+  <title>Flight Search</title>
+  <!--
+    <meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com https://maps.googleapis.com; connect-src 'self' https://maps.googleapis.com  https://cdn.jsdelivr.net; img-src 'self' https://cdn.jetphotos.com  https://www.flightradar24.com; style-src 'self' 'unsafe-inline';"
+    >
+    <! --
+      style-src 'nonce-randomNonce123' is safer than unsafe-inline but then you'd need to add
+      nonce="randomNonce123" next to every style="..." attribute
+   -->
+
+  <!-- importmap is needed because uhtml does imports using a 'bare specifier'
+   (example import SOMECONST from 'domconstants/constants', as opposed to import thing from '../lib')
+   so for these it should be clear which module should be loaded -->
+  <script type="importmap">
+    {
+      "imports": {
+        "domconstants/constants": "https://cdn.jsdelivr.net/npm/domconstants@1.1.6/esm/constants.js",
+        "domconstants/re": "https://cdn.jsdelivr.net/npm/domconstants@1.1.6/esm/re.js",
+        "custom-function/factory": "https://cdn.jsdelivr.net/npm/custom-function@1.0.6/esm/factory.js",
+        "@webreflection/uparser": "https://cdn.jsdelivr.net/npm/@webreflection/uparser@0.3.3/esm/index.js",
+        "udomdiff": "https://cdn.jsdelivr.net/npm/udomdiff@1.0.1/esm/index.js"
+      }
+    }
+  </script>
+
+  <!-- ELIX web components library -->
+  <script type="module" src="https://cdn.jsdelivr.net/npm/elix@latest/src/elix.js"></script>
+  <!-- <script type="module" src="https://cdn.jsdelivr.net/npm/elix@15.0.1/src/plain/PlainDrawerWithGrip.js"></script> -->
+  <script type="module" src="https://cdn.jsdelivr.net/npm/elix@latest/define/DrawerWithGrip.js"></script>
+
+  <!-- add some css -->
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+    }
+
+    th,
+    td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+    }
+
+    th {
+      background-color: #f2f2f2;
+    }
+
+    tr:nth-child(even) {
+      background-color: #f2f2f2;
+    }
+
+    tr:hover {
+      background-color: #f1f1f1;
+    }
+
+    .leaflet-popup-content-wrapper {
+      background: white;
+      color: black;
+    }
+
+    .leaflet-popup-tip-container {
+      display: none;
+    }
+
+    elix-drawer-with-grip>h1 {
+      font-size: 1.5em;
+      background-color: cadetblue;
+    }
+  </style>
+
+  <!-- Use openfreemap instead of openstreetmap -->
+  <script src="https://unpkg.com/maplibre-gl/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl/dist/maplibre-gl.css" rel="stylesheet" />
+
+
+  <script type="module">
+    import { html, render } from 'https://cdn.jsdelivr.net/npm/uhtml@4.5.11/esm/index.js';
+
+    import { createSignal, createComputed, createMemo, createResource, createEffect, createRoot, getOwner } from 'https://cdn.jsdelivr.net/npm/solid-js@latest/dist/solid.js';
+
+
+    // import { DrawerWithGrip } from 'https://cdn.jsdelivr.net/npm/elix@15.0.1/src/elix.js';
+    import ElixDrawerWithGrip from 'https://cdn.jsdelivr.net/npm/elix@latest/define/DrawerWithGrip.js';
+
+    function isPromise(obj) {
+      return !!obj && (typeof obj === 'object' || typeof obj === 'function') && typeof obj.then === 'function';
+    }
+
+    function yesterday() {
+      const retVal = new Date();
+      retVal.setDate(new Date().getDate() - 1);
+      return retVal;
+    }
+
+    /**
+     * createUrlSignal initializes a signal based on a URL parameter.
+     * The value of the signal updates the URL when changed, and vice-versa.
+     * 
+     * @param {string} param the name of the URL parameter
+     * @param {string?} defaultValue
+     * @returns {[() => string, (value: string) => void]} getter and setter for the signal
+     */
+    const createUrlSignal = (param, defaultValue) => {
+      // Initialize from URL or default
+      const url = new URL(window.location);
+      const initial = JSON.parse(url.searchParams.get(param)) ?? defaultValue;
+      const [getValue, setValue] = createSignal(initial);
+
+      // Update URL when signal changes
+      createEffect(() => {
+        const newValue = getValue();
+        const url = new URL(window.location);
+        if (newValue === defaultValue) {
+          url.searchParams.delete(param);
+        } else {
+          url.searchParams.set(param, JSON.stringify(newValue));
+        }
+        history.replaceState(null, '', url);
+      });
+
+      // Update signal when URL changes
+      window.addEventListener('popstate', () => {
+        const url = new URL(window.location);
+        const pVal = JSON.parse(url.searchParams.get(param) ?? 'null');
+        setValue(pVal ?? defaultValue);
+      });
+
+      return [getValue, setValue];
+    };
+
+    /**
+     * This function renders the flights in a table.
+     *
+     * @param {Array<TFlight>} flightsArray
+     * @param {TFlight} pickedFlight
+     * @param {(flight: TFlight) => void} setPickedFlight
+     */
+    const htmlFlightsTable = (flightsArray, pickedFlight, setPickedFlight) => html`
+      <table id="flightsTable">
+        <tr>
+            <th>Call Sign</th>
+            <th>Aircraft</th>
+            <th>Airline</th>
+            <th>Origin</th>
+            <th>Destination</th>
+            <th>Time</th>
+            <th>Image</th>
+        </tr>
+        ${(flightsArray ?? []).map(flight => html`
+            <tr @click=${() => setPickedFlight(flight)} style=${pickedFlight === flight ? "background-color: yellow" : ""}>
+              <td>${flight.identification?.callsign}</td>
+              <td>${flight.aircraft?.model?.text ?? flight.aircraft?.model?.code}</td>
+              <td>${flight.airline?.name}</td>
+              <td>${flight.airport?.origin?.name}</td>
+              <td>${flight.airport?.destination?.name}</td>
+              <td>${flight.analysis?.[0].dateTime.replace("T", " ")}</td>
+              <td>
+                <img src="${flight.aircraft?.images?.thumbnails?.[0].src}"
+                  alt="${flight.aircraft?.model?.text ?? flight.aircraft?.model?.code}"
+                  style="height: 40pt;" />
+              </td>
+            </tr>
+          `)
+      }
+      </table>
+    `;
+
+    customElements.define(
+      'flights-map',
+      // class doesn't need to be named, but it's useful for debugging
+      class FlightsMap extends HTMLElement {
+        #map = {};
+        #mapReady = false;
+        id = 'map' + Math.random().toString(36).substring(7);
+
+        static {
+          // Define the default display type
+          if (!document.adoptedStyleSheets.some(sheet => 
+            sheet.cssRules[0]?.selectorText === 'flights-map')) {
+            const sheet = new CSSStyleSheet();
+            sheet.replaceSync('flights-map { display: block; }');
+            document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+          }
+        }
+
+        /** @type {TFlight} */
+        #pickedFlight = undefined;
+        #renderedFlight = undefined;
+
+        get pickedFlight() { return this.#pickedFlight; }
+        set pickedFlight(flight) {
+          this.#pickedFlight = flight;
+          this.render();
+        }
+
+        constructor() {
+          super();
+          // no shadow root for the map
+          // this.attachShadow({ mode: 'open' });
+        }
+
+        connectedCallback() {
+          // this.render();
+
+          console.log('FlightsMap connected to the DOM', this);
+          this.#map = new maplibregl.Map({
+            style: 'https://tiles.openfreemap.org/styles/liberty',
+            center: [4.460278, 51.189442],
+            zoom: 9.5,
+            container: this.shadowRoot ?? this,
+          });
+
+          this.#map.on('load', () => {
+            console.log('Map is ready');
+            this.#mapReady = true;
+            // Re-render to show any pending flight data
+            this.render();
+          });
+        }
+
+        // onFirstRender(element) {
+        //   if (element) {
+        //     const flightsMapElement = this;
+        //     console.log('FlightsMap connected to the DOM', flightsMapElement);
+        //     setTimeout(() => {
+        //       console.log('Creating new maplibregl.Map in', flightsMapElement, element.id);
+        //       flightsMapElement.#map = new maplibregl.Map({
+        //         style: 'https://tiles.openfreemap.org/styles/liberty',
+        //         center: [4.460278, 51.189442],
+        //         zoom: 9.5,
+        //         container: element.id,
+        //       });
+        //     }, 100);
+        //   } else {
+        //     // element is null, so we are being disconnected
+        //     console.warn('FlightsMap disconnected from the DOM');
+        //     // time for cleanup?
+        //   }
+        // }
+
+        render() {
+          console.log('Rendering FlightsMap. Shadow root?', this.shadowRoot);
+          // <!-- Use openfreemap instead of openstreetmap -->
+          // <script src="https://unpkg.com/maplibre-gl/dist/maplibre-gl.js"><\/script>
+          // <link href="https://unpkg.com/maplibre-gl/dist/maplibre-gl.css" rel="stylesheet" />
+
+          /**
+           * This function clears the map of all trails and markers.
+           */
+          const clearMap = (map) => {
+            if (!this.#mapReady) {
+              console.log('[clearMap] Map not ready yet');
+              return;
+            }
+
+            // Remove all custom layers and sources
+            console.log('Clearing map', map);
+            const layers = map.getStyle().layers;
+            const sources = map.getStyle().sources;
+            
+            // Remove layers first (they depend on sources)
+            layers.forEach((layer) => {
+              if (layer.id.startsWith('custom-')) {
+                map.removeLayer(layer.id);
+              }
+            });
+            
+            // Then remove sources
+            Object.keys(sources).forEach((sourceId) => {
+              if (sourceId.startsWith('custom-')) {
+                map.removeSource(sourceId);
+              }
+            });
+          }
+
+          /**
+           * Gets a trail as input (array of { lat, lng, alt, spd, ts, hd, index } objects)
+           * and adds it to the map
+           * 
+           * @param (Array<{ lat: number, lng: number, alt: number, spd: number, ts: number, hd: number, index: number } }>) trail
+           * @param (string) color (default red)
+           * @param (number) weight (default 2)
+           */
+          function addTrailToMap(map, trail, color = 'red', weight = 2) {
+            const altToRadius = (a) => 5 + a / 20;
+            const knotsToKph = (knots) => knots * 1.852;
+            const feetToMeter = (feet) => feet * 0.3048;
+            /** single array element object to popup message */
+            const toPopupMsg = ({ lat, lng, alt, spd, ts, hd, index, currentRateOfClimb }) =>
+              `alt ${alt}ft (${Math.round(feetToMeter(alt))}m), spd ${spd}kt (${Math.round(knotsToKph(spd))}km/h), ts ${new Date(ts * 1000).toLocaleString('nl-BE', { timeZone: 'Europe/Brussels' })}, hd ${hd}°, index ${index}${currentRateOfClimb ? ` 🚀${Math.round(currentRateOfClimb, 0)}ft/min` : ''}`; // opstijgend vliegtuig: 🛫 hoogte ⬆️ snelheid 🏃‍♂️ timestamp ⏰ kompas 🧭
+
+            const sourceId = `custom-trail-${Math.random().toString(36).slice(2)}`;
+            const layerId = `${sourceId}-line`;
+            const dotsLayerId = `${sourceId}-dots`;
+
+            // Create GeoJSON data
+            const geojson = {
+              type: 'FeatureCollection',
+              features: [
+                // Line feature
+                {
+                  type: 'Feature',
+                  properties: {},
+                  geometry: {
+                    type: 'LineString',
+                    coordinates: trail.map(point => [point.lng, point.lat])
+                  }
+                },
+                // Points feature
+                ...trail.map(point => ({
+                  type: 'Feature',
+                  properties: {
+                    description: toPopupMsg(point),
+                    altitude: point.alt
+                  },
+                  geometry: {
+                    type: 'Point',
+                    coordinates: [point.lng, point.lat]
+                  }
+                }))
+              ]
+            };
+
+            // Add source
+            map.addSource(sourceId, {
+              type: 'geojson',
+              data: geojson
+            });
+
+            // Add line layer
+            map.addLayer({
+              id: layerId,
+              type: 'line',
+              source: sourceId,
+              layout: {
+                'line-join': 'round',
+                'line-cap': 'round'
+              },
+              paint: {
+                'line-color': color,
+                'line-width': weight
+              },
+              filter: ['==', '$type', 'LineString']
+            });
+
+            // Add dots layer
+            map.addLayer({
+              id: dotsLayerId,
+              type: 'circle',
+              source: sourceId,
+              paint: {
+                'circle-radius': ['interpolate', ['linear'], ['get', 'altitude'],
+                  0, 5,
+                  40000, 15
+                ],
+                'circle-color': color,
+                'circle-stroke-width': 1,
+                'circle-stroke-color': '#fff'
+              },
+              filter: ['==', '$type', 'Point']
+            });
+
+            // Add popup on click
+            map.on('click', dotsLayerId, (e) => {
+              const coordinates = e.features[0].geometry.coordinates.slice();
+              const description = e.features[0].properties.description;
+
+              new maplibregl.Popup()
+                .setLngLat(coordinates)
+                .setHTML(description)
+                .addTo(map);
+            });
+
+            // Change cursor on hover
+            map.on('mouseenter', dotsLayerId, () => {
+              map.getCanvas().style.cursor = 'pointer';
+            });
+            map.on('mouseleave', dotsLayerId, () => {
+              map.getCanvas().style.cursor = '';
+            });
+          }
+
+          /**
+           * This function shows only the given flight on the map.
+           *
+           * @param {Object} map
+           * @param {Object} flight
+           */
+          const showFlightOnMap = (map, flight) => {
+            if (!this.#mapReady) {
+              console.log('[showFlightOnMap] Map not ready yet');
+              return;
+            }
+
+            const trailObjArr = trailObjectArrayFromHistory(flight.trail);
+            console.log('[showFlightOnMap] Clearing map');
+            clearMap(map);
+
+            console.log('[showFlightOnMap] Adding full trail to map', trailObjArr.length);
+            addTrailToMap(map, trailObjArr, 'purple');
+
+            // overwrite the part of the trail from the spreadsheet in red
+            flight.analysis.forEach(({ subTrail }) => {
+              console.log('[showFlightOnMap] Adding sub-trail to map', subTrail.length);
+              addTrailToMap(map, subTrail, 'red', 5);
+            });
+
+            this.#renderedFlight = this.#pickedFlight;
+          };
+
+          if (this.#renderedFlight != this.#pickedFlight) {
+            console.log('[showFlightOnMap] Picked flight changed', this.#pickedFlight);
+            showFlightOnMap(this.#map, this.#pickedFlight);
+          }
+        }
+
+      }
+    );
+
+    /**
+     * This function fetches the flights for a given date.
+     *
+     * @returns {Promise<Array<Object>>}
+     */
+    const fetchHistoryForDate = async (date) => {
+      const baseUrl = "../../flights_history/data/";
+      const dateString = new Date(date).toISOString().split('T')[0];
+      const response = await fetch(`${baseUrl}${dateString}.jsonl`);
+      const text = await response.text();
+      return text.split('\n')
+        .filter((line) => line.trim() !== '')
+        .map(line => JSON.parse(line));
+    }
+
+    /**
+    * In order to save space, a trail is stored as a rows array of arrays, and a columns object,
+    * where the keys point to the corresponding sub-array index.
+    *
+    * This function will return an array of objects (also containing the index!).
+    *
+    * We also sort by timestamp to be sure the order is correct (was wrong in some cases!)
+    *
+    * ```
+    * trail: {
+    * columns: { alt: 2, hd: 5, lat: 0, lng: 1, spd: 3, ts: 4 },
+    * rows: [
+    * [ 40.897751, 29.321136, 0, 15, 1723993367, 334 ]
+    * ]
+    * }
+    * ```
+    * @returns (Array<Record<string, number>>)
+      */
+    function trailObjectArrayFromHistory(t) {
+      return t.rows
+      .sort((a, b) => a[t.columns.ts] - b[t.columns.ts])
+      .map(
+      (r, rIndex) => Object.fromEntries(
+      [
+      ['index', rIndex],
+      ...Object.entries(t.columns)
+      .map(([name, index]) => [name, r[index]]),
+      ]
+      )
+      )
+      }
+
+    /**
+    * The app component is the main component that will be rendered.
+    * It will contain the state of the app, and will be responsible for
+    * rendering the other components.
+    * It is standalone, so no properties are passed to it.
+    * It can control the url.
+    */
+    customElements.define(
+      'app-flights-history',
+      // class doesn't need to be named, but it's useful for debugging
+      class AppFlightsHistory extends HTMLElement {
+        #sDrawerOpened = createUrlSignal('drawerOpened', true);
+        #sDateInputValue = createSignal(yesterday().toISOString().substring(0, 10));
+        // after pressing enter or clicking search button, the date will be set to this value
+        #sSearchDate = createUrlSignal('searchDate', yesterday().toISOString().substring(0, 10));
+        // #sLoadedHistory = createSignal({
+        // flights: [],
+        // date: '',
+        // });
+        #rLoadedHistory = createResource(
+          this.#sSearchDate[0],
+          async (source, {value, refetching}) => {
+            const history = source ? await fetchHistoryForDate(source) : [];
+            console.log(`History for ${source} fetched`, history);
+            return { date: source, flights: history };
+          },
+        );
+        #sPickedFlightTimestamp = createUrlSignal('pickedFlightTimestamp', undefined);
+        /** @type { [ () => TFlight, (f: TFlight) => void ] } */
+        #sPickedFlight = createSignal();
+
+        // #sPickedFlight = createSignal('pickedFlight');
+
+
+        constructor() {
+          super();
+          // no shadow dom for the app
+          // this.attachShadow({ mode: 'open' });
+
+          // Make sure we rerender whenever the state changes using signal.js
+          createRoot(() => {
+            console.log("Destroy signal.js root?");
+          });
+
+          createComputed(() => {
+            // date only of this.#sPickedFlightTimestamp[0]()
+            const dateOnly = this.#sPickedFlightTimestamp[0]()?.split('T')[0];
+            this.#sDateInputValue[1](dateOnly);
+            this.#sSearchDate[1](dateOnly);
+            const loadedHistory = this.#rLoadedHistory?.[0]?.();
+            if (loadedHistory) {
+              const pickedFlight = loadedHistory?.flights?.find(
+                (flight) => flight.analysis?.[0].dateTime === this.#sPickedFlightTimestamp[0]()
+              );
+              this.#sPickedFlight[1](pickedFlight);
+              console.log('Picked flight timestamp changed', this.#sPickedFlightTimestamp[0](), "=>", pickedFlight);
+
+              this.#sPickedFlightTimestamp[1](pickedFlight?.analysis?.[0].dateTime);
+            } else {
+              console.log('No loaded history yet');
+            }
+          });
+
+          // Rerender when a signal changes
+          createEffect(() => {
+            this.render();
+          });
+
+          /** @typedef {{flights: Array<any>, date: string}} TLoadedHistory */
+        }
+
+        connectedCallback() {
+          this.render();
+        }
+
+        render() {
+          render(this, html`
+            <div>
+              <elix-drawer-with-grip .opened=${this.#sDrawerOpened[0]()} .backdropPartType=${undefined}
+                @openedchange=${(event) => this.#sDrawerOpened[1](event.detail.opened)}
+                style="width: 50vw;">
+                <h1>Flight Search</h1>
+                <input type="date" id="flightDate" .value="${this.#sSearchDate[0]() ?? this.#sDateInputValue[0]()}"
+                  @keydown=${(event)=> {
+                    if (event.key === 'Enter') {
+                      this.#sSearchDate[1](event.target.value);
+                      // fetchHistoryForDate(event.target.value).then((flightsArray) => this.#rLoadedHistory[1]({ date: event.target.value, flights: flightsArray }));
+                    }
+                  }}
+                  onchange=${(event) => {
+                    console.log('input onchange event');
+                    this.#sDateInputValue[1](event.target.value);
+                  }}
+                />
+                <button @click=${(_evt)=>
+                    this.#sSearchDate[1](this.#sDateInputValue[0]())
+                    // fetchHistoryForDate(this.#sSearchDate[0]()).then(this.#sLoadedHistory[1])
+                    // fetchHistoryForDate(this.#sSearchDate[0]()).then((flightsArray) => this.#sLoadedHistory[1]({ date: this.#sSearchDate[0](), flights: flightsArray }))
+                  }>Zoeken</button>
+                ${
+                htmlFlightsTable(this.#rLoadedHistory[0]()?.flights, this.#sPickedFlight[0](), (flight) =>
+                this.#sPickedFlightTimestamp[1](flight.analysis?.[0].dateTime))
+                }
+              </elix-drawer-with-grip>
+
+              <flights-map .pickedFlight=${this.#sPickedFlight[0]()} .pickedFlightTimestamp=${this.#sPickedFlightTimestamp} 
+                style="width: 100%; height: 80vh;" />
+              ${htmlFlightsTable(this.#sPickedFlight[0]() ? [this.#sPickedFlight[0]()] : [], this.#sPickedFlight[0](), this.#sPickedFlight[1])}
+            </div>
+          `);
+        }
+      },
+    );
+
+  </script>
+  <!-- <script src="https://maps.googleapis.com/maps/api/js?key=YOUR_API_KEY"></script> -->
+</head>
+
+<body>
+  <app-flights-history />
+</body>
+
+</html>

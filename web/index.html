@@ -528,7 +528,7 @@
             const loadedHistory = this.#rLoadedHistory?.[0]?.();
             if (loadedHistory) {
               const pickedFlight = loadedHistory?.flights?.find(
-                (flight) => flight.analysis?.[0].dateTime === this.#sPickedFlightTimestamp[0]()
+                (flight) => Date.parse(flight.analysis?.[0].dateTime) === Date.parse(this.#sPickedFlightTimestamp[0]())
               );
               this.#sPickedFlight[1](pickedFlight);
               console.log('Picked flight timestamp changed', this.#sPickedFlightTimestamp[0](), "=>", pickedFlight);
